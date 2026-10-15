@@ -5,9 +5,9 @@ import pytz
 import dateutil.parser
 import threading
 import time
+import json
 from fastapi import FastAPI
 from pydantic import BaseModel
-from openai import OpenAI
 
 app = FastAPI()
 
@@ -48,7 +48,6 @@ def fetch_and_load_data():
             print(f"Error fetching page {page}: {e}")
         page += 1
 
-    # Extract just the order data
     orders = {oid: data for oid, (dt_updated, data) in orders.items()}
 
     # 2. Setup Database Schema
@@ -79,11 +78,11 @@ def fetch_and_load_data():
     # 3. Load Data into DB
     for oid, o in orders.items():
         dt = dateutil.parser.parse(o["created_at"])
-        dt_ist = dt.astimezone(ist) # Normalize to IST
+        dt_ist = dt.astimezone(ist)
         
         amount = o["amount"]
         rate = rates.get(o["currency"], 1.0)
-        amount_usd = round(amount * rate, 6) # Prevent floating point drift
+        amount_usd = round(amount * rate, 6)
         
         quarter = f"Q{(dt_ist.month - 1) // 3 + 1}"
         
@@ -99,14 +98,8 @@ def fetch_and_load_data():
     DB.commit()
     print(f"Successfully loaded {len(orders)} deduplicated orders into DB.")
 
-# Load data in background so the server starts immediately
+# Load data in background
 threading.Thread(target=fetch_and_load_data, daemon=True).start()
-
-# LLM Setup using AI Pipe (OpenAI-compatible)
-client = OpenAI(
-    api_key=os.environ.get("AIPIPE_API_KEY"),
-    base_url="https://api.aipipe.org/v1"
-)
 
 schema = """
 Table orders (contains ALL orders, including paid, refunded, and void).
@@ -134,9 +127,8 @@ Rules:
 """
 
 def get_answer(question: str) -> str:
-    # Wait for DB to be fully loaded
     cursor = DB.cursor()
-    for _ in range(60): # Wait up to 30 seconds
+    for _ in range(60):
         try:
             cursor.execute("SELECT COUNT(*) FROM orders")
             if cursor.fetchone()[0] > 0:
@@ -153,15 +145,35 @@ Do NOT explain. ONLY output the SQL query.
 Question: {question}
 SQL:"""
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini", # Fast, cheap, excellent for SQL
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0 # Crucial for deterministic SQL generation
-    )
-    
-    sql = response.choices[0].message.content.strip()
-    sql = sql.replace("```sql", "").replace("```", "").strip()
-    
+    # Use standard HTTP requests instead of the openai library
+    api_key = os.environ.get("AIPIPE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return "Error: API key not found in environment variables."
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0
+    }
+
+    try:
+        response = requests.post(
+            "https://api.aipipe.org/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+        response.raise_for_status()
+        result = response.json()
+        sql = result["choices"][0]["message"]["content"].strip()
+        sql = sql.replace("```sql", "").replace("```", "").strip()
+    except Exception as e:
+        return f"Error calling LLM: {str(e)}"
+
     # Execute Query
     try:
         cursor.execute(sql)
@@ -174,10 +186,9 @@ SQL:"""
         if len(rows) == 1 and len(cols) == 1:
             val = rows[0][0]
             if isinstance(val, float):
-                return f"{val:.2f}" # Money correct to the cent
+                return f"{val:.2f}"
             return str(val)
             
-        # Format multiple rows cleanly
         result = []
         for row in rows:
             row_dict = {}

@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
 requests
-openai
 pytz
 python-dateutil
