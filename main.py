@@ -1,14 +1,17 @@
+import os
 import sqlite3
 import requests
 import pytz
 import dateutil.parser
 import threading
 import time
-import re
 from fastapi import FastAPI
 from pydantic import BaseModel
+from openai import OpenAI
 
 app = FastAPI()
+
+# In-memory SQLite for blazing fast queries
 DB = sqlite3.connect(":memory:", check_same_thread=False)
 
 def fetch_and_load_data():
@@ -21,25 +24,34 @@ def fetch_and_load_data():
     }
     
     orders = {}
+    rates = {"USD": 1.0, "EUR": 1.03, "INR": 0.01179}
+    
     page = 1
     total_pages = 1
     
+    # 1. Fetch all pages and deduplicate by latest updated_at
     while page <= total_pages:
         params["page"] = page
         try:
-            res = requests.get(base_url, params=params, timeout=10).json()
-            total_pages = res["pages"]
-            for order in res["orders"]:
+            res = requests.get(base_url, params=params, timeout=15).json()
+            total_pages = res.get("pages", 1)
+            for order in res.get("orders", []):
                 oid = order["id"]
                 dt_updated = dateutil.parser.parse(order["updated_at"])
-                if oid not in orders or dt_updated > orders[oid][0]:
+                
+                if oid not in orders:
                     orders[oid] = (dt_updated, order)
+                else:
+                    if dt_updated > orders[oid][0]:
+                        orders[oid] = (dt_updated, order)
         except Exception as e:
             print(f"Error fetching page {page}: {e}")
         page += 1
 
+    # Extract just the order data
     orders = {oid: data for oid, (dt_updated, data) in orders.items()}
 
+    # 2. Setup Database Schema
     cursor = DB.cursor()
     cursor.execute("""
         CREATE TABLE orders (
@@ -60,78 +72,71 @@ def fetch_and_load_data():
         )
     """)
     
-    rates = {"USD": 1.0, "EUR": 1.03, "INR": 0.01179}
     ist = pytz.timezone("Asia/Kolkata")
     month_names = ["", "January", "February", "March", "April", "May", "June", 
                    "July", "August", "September", "October", "November", "December"]
 
+    # 3. Load Data into DB
     for oid, o in orders.items():
         dt = dateutil.parser.parse(o["created_at"])
-        dt_ist = dt.astimezone(ist)
-        amount_usd = o["amount"] * rates.get(o["currency"], 1.0)
+        dt_ist = dt.astimezone(ist) # Normalize to IST
+        
+        amount = o["amount"]
+        rate = rates.get(o["currency"], 1.0)
+        amount_usd = round(amount * rate, 6) # Prevent floating point drift
+        
         quarter = f"Q{(dt_ist.month - 1) // 3 + 1}"
         
         cursor.execute(
             "INSERT OR IGNORE INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (oid, o["customer"], o["region"], o["product"], o["qty"],
-             amount_usd, o["currency"], o["status"],
-             dt_ist.strftime("%Y-%m-%d %H:%M:%S"), dt_ist.year,
-             dt_ist.month, month_names[dt_ist.month], quarter, dt_ist.strftime("%A"))
+            (
+                oid, o["customer"], o["region"], o["product"], o["qty"],
+                amount_usd, o["currency"], o["status"],
+                dt_ist.strftime("%Y-%m-%d %H:%M:%S"), dt_ist.year,
+                dt_ist.month, month_names[dt_ist.month], quarter, dt_ist.strftime("%A")
+            )
         )
     DB.commit()
-    print(f"Loaded {len(orders)} orders into DB.")
+    print(f"Successfully loaded {len(orders)} deduplicated orders into DB.")
 
+# Load data in background so the server starts immediately
 threading.Thread(target=fetch_and_load_data, daemon=True).start()
 
-def parse_question_to_sql(question: str) -> str:
-    q = question.lower()
-    
-    # 1. Determine Metric
-    if any(word in q for word in ["revenue", "earnings", "money", "total amount", "refunds", "refunded amount"]):
-        metric = "SUM(amount_usd)"
-    elif any(word in q for word in ["sold", "quantity", "how many", "units", "total qty"]):
-        metric = "SUM(qty)"
-    elif "number of orders" in q or "how many orders" in q:
-        metric = "COUNT(id)"
-    else:
-        metric = "SUM(amount_usd)" # Default fallback
-        
-    # 2. Determine Status
-    if "refunded" in q or "refunds" in q:
-        status = "'refunded'"
-    elif "void" in q:
-        status = "'void'"
-    else:
-        status = "'paid'" # Revenue/sold implies paid
-        
-    # 3. Determine Filters
-    conditions = [f"status = {status}"]
-    
-    regions = ["north", "south", "east", "west", "central"]
-    for r in regions:
-        if r in q:
-            conditions.append(f"region = '{r.capitalize()}'")
-            
-    products = ["juicer", "grinder", "toaster", "kettle", "rice cooker", "blender", "mixer", "air fryer"]
-    for p in products:
-        if p in q:
-            conditions.append(f"product = '{p.title()}'")
-            
-    # Time parsing
-    month_match = re.search(r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b', q)
-    if month_match:
-        conditions.append(f"month_name = '{month_match.group(1).capitalize()}'")
-        
-    year_match = re.search(r'\b(2025|2026|2027)\b', q)
-    if year_match:
-        conditions.append(f"year = {year_match.group(1)}")
-        
-    return f"SELECT {metric} FROM orders WHERE {' AND '.join(conditions)}"
+# LLM Setup using AI Pipe (OpenAI-compatible)
+client = OpenAI(
+    api_key=os.environ.get("AIPIPE_API_KEY"),
+    base_url="https://api.aipipe.org/v1"
+)
+
+schema = """
+Table orders (contains ALL orders, including paid, refunded, and void).
+- id: unique order id
+- customer: customer id
+- region: one of North, South, East, West, Central
+- product: exact product name as spelled in the database
+- qty: quantity of items
+- amount_usd: total amount in USD (amount * exchange rate)
+- currency: original currency (USD, EUR, INR)
+- status: 'paid', 'refunded', or 'void'
+- created_at_ist: timestamp in Asia/Kolkata timezone
+- year: year in IST
+- month: month number (1-12) in IST
+- month_name: full month name (e.g., 'March')
+- quarter: 'Q1', 'Q2', 'Q3', 'Q4'
+- day_of_week: day name (e.g., 'Monday')
+
+Rules:
+- "Revenue" means SUM(amount_usd) WHERE status = 'paid'.
+- "Sold" items or "quantity sold" means SUM(qty) WHERE status = 'paid'.
+- Dates and times must be evaluated in IST. Use year, month, month_name, or created_at_ist.
+- Money is in USD.
+- Return ONLY the raw SQL query. No markdown, no explanations.
+"""
 
 def get_answer(question: str) -> str:
+    # Wait for DB to be fully loaded
     cursor = DB.cursor()
-    # Wait for DB to load
-    for _ in range(30):
+    for _ in range(60): # Wait up to 30 seconds
         try:
             cursor.execute("SELECT COUNT(*) FROM orders")
             if cursor.fetchone()[0] > 0:
@@ -140,20 +145,52 @@ def get_answer(question: str) -> str:
             pass
         time.sleep(0.5)
 
-    sql = parse_question_to_sql(question)
+    prompt = f"""You are an expert SQL agent.
+{schema}
+The user will ask a question. Write a SQLite query to answer it.
+Do NOT explain. ONLY output the SQL query.
+
+Question: {question}
+SQL:"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini", # Fast, cheap, excellent for SQL
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0 # Crucial for deterministic SQL generation
+    )
     
+    sql = response.choices[0].message.content.strip()
+    sql = sql.replace("```sql", "").replace("```", "").strip()
+    
+    # Execute Query
     try:
         cursor.execute(sql)
         rows = cursor.fetchall()
-        if not rows or rows[0][0] is None:
+        
+        if not rows:
             return "0"
             
-        val = rows[0][0]
-        if isinstance(val, float):
-            return f"{val:.2f}" # Money correct to the cent
-        return str(val)
+        cols = [description[0] for description in cursor.description]
+        if len(rows) == 1 and len(cols) == 1:
+            val = rows[0][0]
+            if isinstance(val, float):
+                return f"{val:.2f}" # Money correct to the cent
+            return str(val)
+            
+        # Format multiple rows cleanly
+        result = []
+        for row in rows:
+            row_dict = {}
+            for col, val in zip(cols, row):
+                if isinstance(val, float):
+                    val = round(val, 2)
+                row_dict[col] = val
+            result.append(str(row_dict))
+            
+        return "\n".join(result)
+        
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error executing query: {str(e)}"
 
 class QuestionRequest(BaseModel):
     question: str
@@ -163,7 +200,8 @@ class AnswerResponse(BaseModel):
 
 @app.post("/", response_model=AnswerResponse)
 def ask_question(req: QuestionRequest):
-    return {"answer": get_answer(req.question)}
+    ans = get_answer(req.question)
+    return {"answer": ans}
 
 if __name__ == "__main__":
     import uvicorn
