@@ -1,5 +1,3 @@
 fastapi
-uvicorn[standard]
+uvicorn
 requests
-pytz
-python-dateutil
