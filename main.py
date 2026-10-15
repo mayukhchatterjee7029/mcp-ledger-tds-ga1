@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Literal
@@ -15,6 +17,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 DATA_URL = os.getenv(
     "LEDGER_DATA_URL",
@@ -225,9 +229,22 @@ def _answer(plan: Plan) -> Any:
     ]
 
 
-@app.on_event("startup")
-async def startup() -> None:
-    await _load_data()
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        await _load_data()
+    except httpx.HTTPStatusError as error:
+        logger.error(
+            "Ledger data request failed with HTTP %s; configure a current "
+            "LEDGER_DATA_URL value",
+            error.response.status_code,
+        )
+    except httpx.HTTPError:
+        logger.exception("Ledger data request failed")
+    yield
+
+
+app.router.lifespan_context = lifespan
 
 
 @app.post("/")
