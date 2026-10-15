@@ -237,3 +237,13 @@ async def ask(question: Question) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Ledger data is not loaded")
     plan = await _make_plan(question.question)
     return {"answer": _answer(plan)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+    )
